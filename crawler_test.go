@@ -12,7 +12,6 @@ func TestFetch(t *testing.T) {
 	if node == nil {
 		t.Error("Can not retrieve URL", TEST_URL)
 	}
-	fmt.Println(node)
 }
 
 func TestParseFollow(t *testing.T) {
@@ -22,6 +21,7 @@ func TestParseFollow(t *testing.T) {
 		}
 	}()
 	var node = fetch(TEST_URL)
+	//var node = fetchLocal("/Users/sonientaegi/temp.html")
 	var userNames = parseFollow(node)
 
 	fmt.Println(userNames)
