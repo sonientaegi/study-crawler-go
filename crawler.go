@@ -1,24 +1,27 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"golang.org/x/net/html"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strings"
+	"runtime/pprof"
 	"study-crawler-go/utils"
 	"sync"
 	"time"
 )
 
 func fetch(url string) *html.Node {
-	resp, err := http.Get(url)
+	resp, err := client.Get(url)
 	if err != nil {
 		log.Println(err)
 		return nil
 	}
+	defer func() {
+		resp.Body.Close()
+	}()
 
 	node, err := html.Parse(resp.Body)
 	if err != nil {
@@ -119,58 +122,143 @@ TRAVERSAL:
 			})
 		}
 	}
-
 	return userNames
 }
 
-const INITIAL_URL = "https://github.com/SonienTaegi?tab=followers"
-
-var m sync.Mutex
-var visited = make(map[string]bool)
-
-func crawl(userName string) {
-	m.Lock()
-	if visited[userName] {
-		m.Unlock()
-		return
+func crawl(userName string) (bool, []string) {
+	visited.m.Lock()
+	if visited.userNames[userName] {
+		visited.m.Unlock()
+		return false, nil
 	}
 
-	visited[userName] = true
-	m.Unlock()
+	visited.userNames[userName] = true
+	visited.m.Unlock()
 
 	var url = fmt.Sprintf("https://github.com/%s?tab=followers", userName)
-	var done = make(chan bool)
-	var followers = parseFollow(fetch(url))
-
-	var msg = fmt.Sprintf("%20s : %d ", userName, len(followers))
-	if len(followers) == 0 {
-		file, _ := os.Create(userName + ".html")
-		resp, err := http.Get(fmt.Sprintf("https://github.com/%s?tab=followers", userName))
-		if err != nil {
-			msg += fmt.Sprint(err)
-			errBytes, _ := ioutil.ReadAll(strings.NewReader(fmt.Sprint(err)))
-			file.Write(errBytes)
-		} else {
-			body, _ := ioutil.ReadAll(resp.Body)
-			file.Write(body)
-		}
-		file.Close()
-	}
-	log.Print(msg)
-
-	for _, follower := range followers {
-		time.Sleep(time.Second)
-		go func(follower string) {
-			crawl(follower)
-			done <- true
-		}(follower)
-	}
-
-	for i := 0; i < len(followers); i++ {
-		<-done
+	var node = fetch(url)
+	if node != nil {
+		return true, parseFollow(node)
+	} else {
+		return false, nil
 	}
 }
 
+func worker(id string, chanRequest <-chan string, chanResponse chan<- string, chanTerminate <-chan bool) {
+	for {
+		// time.Sleep(time.Millisecond * 500)
+		select {
+		case <-chanTerminate:
+			return
+		case userName := <-chanRequest:
+			if ok, userNames := crawl(userName); ok && len(userNames) > 0 {
+				for _, u := range userNames {
+					chanResponse <- u
+				}
+				time.Sleep(time.Second * 1)
+			} else {
+				log.Println(id, "wait ...")
+				time.Sleep(time.Second * 10)
+			}
+		}
+	}
+}
+
+const NUM_OF_WORKERS = 8
+const NUM_OF_MAX_RESULT = 100000
+
+var client = &http.Client{
+	Timeout: time.Second * 5,
+}
+
+type _visited struct {
+	m         sync.Mutex
+	userNames map[string]bool
+}
+
+var visited = _visited{
+	userNames: make(map[string]bool),
+}
+
+type _requestQueue struct {
+	m sync.Mutex
+	q *utils.Queue
+}
+
+var requestQueue = _requestQueue{
+	q: new(utils.Queue).Init(),
+}
+
 func main() {
-	crawl("sonientaegi")
+	var wg sync.WaitGroup
+	var chanRequest = make(chan string)
+	var chanResponse = make(chan string)
+	var chanTerminate = make(chan bool)
+
+	wg.Add(NUM_OF_WORKERS)
+	requestQueue.q.Push("sonientaegi")
+
+	go func() {
+		defer func() {
+			recover()
+		}()
+
+		for {
+			var userName string
+			requestQueue.m.Lock()
+			if requestQueue.q.Len() > 0 {
+				userName = requestQueue.q.Pop().(string)
+			}
+			requestQueue.m.Unlock()
+
+			if userName == "" {
+				time.Sleep(time.Second)
+				continue
+			}
+
+			select {
+			case chanRequest <- userName:
+				break
+			}
+		}
+	}()
+
+	go func() {
+		var requestTermination = false
+		var cnt = 0
+		for userName := range chanResponse {
+			if cnt == NUM_OF_MAX_RESULT {
+				if !requestTermination {
+					go func() {
+						for i := 0; i < NUM_OF_WORKERS; i++ {
+							chanTerminate <- true
+						}
+					}()
+					requestTermination = true
+				}
+				continue
+			}
+			cnt++
+			log.Printf("%10d : %s", cnt, userName)
+
+			requestQueue.m.Lock()
+			requestQueue.q.Push(userName)
+			requestQueue.m.Unlock()
+		}
+	}()
+
+	var ctx = context.Background()
+	for i := 0; i < NUM_OF_WORKERS; i++ {
+		var labels = pprof.Labels("ID", fmt.Sprintf("Worker - %03d", i))
+		var f = func(ctx context.Context) {
+			id, _ := pprof.Label(ctx, "ID")
+			worker(id, chanRequest, chanResponse, chanTerminate)
+			wg.Done()
+		}
+		go pprof.Do(ctx, labels, f)
+	}
+
+	wg.Wait()
+	close(chanRequest)
+	close(chanResponse)
 }
