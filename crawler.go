@@ -126,15 +126,6 @@ TRAVERSAL:
 }
 
 func crawl(userName string) (bool, []string) {
-	visited.m.Lock()
-	if visited.userNames[userName] {
-		visited.m.Unlock()
-		return false, nil
-	}
-
-	visited.userNames[userName] = true
-	visited.m.Unlock()
-
 	var url = fmt.Sprintf("https://github.com/%s?tab=followers", userName)
 	var node = fetch(url)
 	if node != nil {
@@ -144,28 +135,42 @@ func crawl(userName string) (bool, []string) {
 	}
 }
 
-func worker(id string, chanRequest <-chan string, chanResponse chan<- string, chanTerminate <-chan bool) {
+func worker(id string, chanRequest chan string, chanResponse chan<- string, chanTerminate <-chan struct{}) {
 	for {
-		// time.Sleep(time.Millisecond * 500)
 		select {
 		case <-chanTerminate:
 			return
-		case userName := <-chanRequest:
-			if ok, userNames := crawl(userName); ok && len(userNames) > 0 {
-				for _, u := range userNames {
-					chanResponse <- u
+		case requset := <-chanRequest:
+			if ok, userNames := crawl(requset); ok && len(userNames) > 0 {
+				for _, userName := range userNames {
+					visited.m.Lock()
+					if visited.userNames[userName] {
+						visited.m.Unlock()
+						continue
+					}
+
+					visited.userNames[userName] = true
+					visited.m.Unlock()
+
+					chanResponse <- userName
+
+					select {
+					case chanRequest <- userName:
+					default:
+						time.Sleep(time.Millisecond)
+					}
 				}
-				time.Sleep(time.Second * 1)
 			} else {
-				log.Println(id, "wait ...")
-				time.Sleep(time.Second * 10)
+				time.Sleep(time.Second * 1)
 			}
 		}
+		time.Sleep(time.Millisecond * 100)
 	}
 }
 
 const NUM_OF_WORKERS = 8
-const NUM_OF_MAX_RESULT = 100000
+const NUM_OF_MAX_RESULT = 10000
+const MAX_QUEUE = NUM_OF_WORKERS * 50
 
 var client = &http.Client{
 	Timeout: time.Second * 5,
@@ -180,72 +185,14 @@ var visited = _visited{
 	userNames: make(map[string]bool),
 }
 
-type _requestQueue struct {
-	m sync.Mutex
-	q *utils.Queue
-}
-
-var requestQueue = _requestQueue{
-	q: new(utils.Queue).Init(),
-}
-
 func main() {
 	var wg sync.WaitGroup
-	var chanRequest = make(chan string)
+	var chanRequest = make(chan string, MAX_QUEUE)
 	var chanResponse = make(chan string)
-	var chanTerminate = make(chan bool)
+	var chanTerminate = make(chan struct{})
 
 	wg.Add(NUM_OF_WORKERS)
-	requestQueue.q.Push("sonientaegi")
-
-	go func() {
-		defer func() {
-			recover()
-		}()
-
-		for {
-			var userName string
-			requestQueue.m.Lock()
-			if requestQueue.q.Len() > 0 {
-				userName = requestQueue.q.Pop().(string)
-			}
-			requestQueue.m.Unlock()
-
-			if userName == "" {
-				time.Sleep(time.Second)
-				continue
-			}
-
-			select {
-			case chanRequest <- userName:
-				break
-			}
-		}
-	}()
-
-	go func() {
-		var requestTermination = false
-		var cnt = 0
-		for userName := range chanResponse {
-			if cnt == NUM_OF_MAX_RESULT {
-				if !requestTermination {
-					go func() {
-						for i := 0; i < NUM_OF_WORKERS; i++ {
-							chanTerminate <- true
-						}
-					}()
-					requestTermination = true
-				}
-				continue
-			}
-			cnt++
-			log.Printf("%10d : %s", cnt, userName)
-
-			requestQueue.m.Lock()
-			requestQueue.q.Push(userName)
-			requestQueue.m.Unlock()
-		}
-	}()
+	chanRequest <- "sonientaegi"
 
 	var ctx = context.Background()
 	for i := 0; i < NUM_OF_WORKERS; i++ {
@@ -258,7 +205,25 @@ func main() {
 		go pprof.Do(ctx, labels, f)
 	}
 
+	totalProcessed := 0
+	go func() {
+		for _ = range chanResponse {
+			totalProcessed++
+			// log.Printf("%10d - %s", totalProcessed, resp)
+		}
+	}()
+
+	time.Sleep(time.Second * 3)
+	for {
+		time.Sleep(time.Millisecond * 100)
+		log.Printf("[%5d/%5d] Queue size = %d", totalProcessed, NUM_OF_MAX_RESULT, len(chanRequest))
+		if totalProcessed >= NUM_OF_MAX_RESULT || len(chanRequest) == 0 {
+			close(chanTerminate)
+			break
+		}
+	}
+
 	wg.Wait()
-	close(chanRequest)
 	close(chanResponse)
+	close(chanRequest)
 }
